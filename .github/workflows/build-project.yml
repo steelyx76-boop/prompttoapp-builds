@@ -1,0 +1,104 @@
+name: Build User Project
+
+on:
+  repository_dispatch:
+    types: [build-project]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Create project directory
+        run: mkdir -p project
+      
+      - name: Download project files from Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PROJECT_ID: ${{ github.event.client_payload.project_id }}
+          USER_ID: ${{ github.event.client_payload.user_id }}
+        run: |
+          cd project
+          
+          # Télécharger tous les fichiers du projet depuis Supabase Storage
+          FILES=$(curl -s "$SUPABASE_URL/storage/v1/object/list/chat/$USER_ID/$PROJECT_ID" \
+            -H "Authorization: Bearer $SUPABASE_KEY" | jq -r '.[].name')
+          
+          for file in $FILES; do
+            echo "Downloading $file..."
+            mkdir -p "$(dirname "$file")"
+            curl -s "$SUPABASE_URL/storage/v1/object/chat/$USER_ID/$PROJECT_ID/$file" \
+              -H "Authorization: Bearer $SUPABASE_KEY" \
+              -o "$file"
+          done
+          
+          echo "✅ Files downloaded"
+          ls -la
+      
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      
+      - name: Install dependencies
+        run: |
+          cd project
+          echo "📦 Installing dependencies..."
+          npm ci --prefer-offline --no-audit
+          echo "✅ Dependencies installed"
+      
+      - name: Build project
+        run: |
+          cd project
+          echo "🔨 Building project..."
+          npm run build
+          echo "✅ Build complete"
+          ls -la dist/
+      
+      - name: Upload build to Supabase Storage
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PROJECT_ID: ${{ github.event.client_payload.project_id }}
+          USER_ID: ${{ github.event.client_payload.user_id }}
+        run: |
+          cd project/dist
+          
+          echo "📤 Uploading build files..."
+          
+          # Uploader chaque fichier
+          find . -type f | while read file; do
+            # Enlever le ./ du début
+            clean_path="${file#./}"
+            echo "Uploading $clean_path..."
+            
+            # Créer le chemin dans Storage
+            curl -X POST \
+              "$SUPABASE_URL/storage/v1/object/builds/$USER_ID/$PROJECT_ID/$clean_path" \
+              -H "Authorization: Bearer $SUPABASE_KEY" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$file" \
+              --fail-with-body || echo "Failed to upload $clean_path"
+          done
+          
+          echo "✅ Build uploaded to Supabase Storage"
+      
+      - name: Notify completion
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          PROJECT_ID: ${{ github.event.client_payload.project_id }}
+        run: |
+          echo "🔔 Notifying completion..."
+          curl -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\": \"success\", \"project_id\": \"$PROJECT_ID\"}"
+          echo "✅ Notification sent"
